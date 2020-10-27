@@ -41,13 +41,12 @@
         </div>
       </a>
       {% if gallery.cover_type == "video" %}
-      {% set video = Video(gallery.cover) %}
-      {{ video.copy() }}
+      {% set video = Video.get(gallery.link, gallery.cover) %}
       <div class="gallery-cover">
         <video autoplay loop muted class="fillWidth">
-          <source src="{{ video }}" type="video/webm" data-source="{{ video }}" data-format="vp8" data-extension="webm">
+		<source src="{{ gallery.link }}/{{ video.copy() }}" type="video/webm" data-source="{{ gallery.link }}/{{ video.copy() }}" data-format="vp8" data-extension="webm">
         </video>
-        <img class="fillWidth" alt="" src="{{ video.generate_thumbnail("900") }}">
+	<img class="fillWidth" alt="" src="{{ gallery.link }}/{{ video.thumbnail((None, 900)) }}">
       </div>
       {% else %}
       {% set cover = Image.get(gallery.link, gallery.cover) %}

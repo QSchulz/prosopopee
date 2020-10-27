@@ -9,6 +9,7 @@ import subprocess
 import sys
 import http.server
 import re
+import ffmpeg
 
 from babel.core import default_locale
 from babel.dates import format_date
@@ -24,6 +25,7 @@ from .utils import encrypt, rfc822, load_settings, CustomFormatter
 from .autogen import autogen
 from .__init__ import __version__
 from .image import imageFactory
+from .video import videoFactory
 
 
 def loglevel(string):
@@ -538,7 +540,7 @@ def build_gallery(settings, gallery_settings, gallery_path, template):
         settings=settings,
         gallery=gallery_settings,
         Image=imageFactory,
-        Video=Video,
+        Video=videoFactory,
         Audio=Audio,
         link=gallery_path,
         name=gallery_path.split("/", 1)[-1],
@@ -582,7 +584,7 @@ def build_gallery(settings, gallery_settings, gallery_path, template):
         settings=settings,
         gallery=gallery_settings,
         Image=imageFactory,
-        Video=Video,
+        Video=videoFactory,
         Audio=Audio,
         link=gallery_light_path,
         name=gallery_path.split("/", 1)[-1],
@@ -633,7 +635,7 @@ def build_index(
         galleries=galleries_cover,
         sub_index=sub_index,
         Image=imageFactory,
-        Video=Video,
+        Video=videoFactory,
     ).encode("Utf-8")
 
     open(Path("build").joinpath(gallery_path, "index.html"), "wb").write(html)
@@ -644,6 +646,54 @@ def build_index(
 
         open(Path("build").joinpath(gallery_path, "index.html"), "wb").write(html)
 
+def render_video_thumbnails(orig):
+    logging.debug("(%s) Rendering video", orig.filepath)
+
+    filepath = Path("build") / orig.filepath.parents[0] / (orig.filepath.stem + "." + SETTINGS["ffmpeg"]["extension"])
+
+    # FIXME: add "cmd" arg to run for "binary"?
+    # FIXME: add missing "other", need to use kwargs probably
+    if not CACHE.needs_to_be_generated(orig.filepath, str(filepath), SETTINGS["ffmpeg"]):
+        logging.debug('(%s) Skipping rendering', orig.filepath)
+    else:
+        ffmpeg.input(orig.filepath).output(
+            filepath,
+            vcodec=SETTINGS["ffmpeg"]["video"],
+            video_bitrate=SETTINGS["ffmpeg"]["vbitrate"],
+            acodec=SETTINGS["ffmpeg"]["audio"],
+            audio_bitrate=SETTINGS["ffmpeg"]["abitrate"],
+            format=SETTINGS["ffmpeg"]["format"],
+            s=SETTINGS["ffmpeg"]["resolution"],
+            ).run(overwrite_output=True, quiet=True)
+        CACHE.cache_picture(orig.filepath, str(filepath), SETTINGS["ffmpeg"])
+
+    logging.debug("(%s) Rendering thumbnails", orig.filepath)
+
+    for thumbnail in orig.thumbnails.values():
+        print(thumbnail.filepath)
+        filepath = Path("build") / thumbnail.filepath
+
+        if not CACHE.needs_to_be_generated(orig.filepath, str(filepath), list(thumbnail.size)):
+            logging.debug('(%s) Skipping cached thumbnail %s: size=%s',
+                    orig.filepath, filepath, thumbnail.size)
+            continue
+
+        logging.debug('(%s) Creating thumbnail %s: size=%s',
+                orig.filepath, filepath, thumbnail.size)
+
+        height, width = thumbnail.size
+        height = height if height is not None else -1
+        width = width if width is not None else -1
+        
+        stream = ffmpeg.input(orig.filepath)
+        if height != -1 or width != -1:
+            stream = ffmpeg.filter(stream, 'scale', height, width)
+
+        # FIXME: multioutput?
+        stream = ffmpeg.output(stream, filepath, vframes=1)
+        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+
+        CACHE.cache_picture(orig.filepath, str(filepath), list(thumbnail.size))
 
 def render_thumbnails(base):
     logging.debug("(%s) Rendering thumbnails", base.filepath)
@@ -827,6 +877,10 @@ def main():
     if not DEFAULTS["test"]:
         with Pool() as pool:
             pool.map(render_thumbnails, imageFactory.base_imgs.values())
+
+        # ffmpeg is already multiprocess anyway, no need to parallelize it more
+        for video in videoFactory.orig_video.values():
+            render_video_thumbnails(video)
 
     for i in includes:
         srcdir = Path(i).dirname()
