@@ -8,9 +8,12 @@ import socketserver
 import subprocess
 import sys
 import http.server
+import re
 
 from babel.core import default_locale
 from babel.dates import format_date
+from multiprocessing import Pool
+from PIL import Image, ImageOps, JpegImagePlugin
 
 from path import Path
 
@@ -20,6 +23,7 @@ from .cache import CACHE
 from .utils import encrypt, rfc822, load_settings, CustomFormatter
 from .autogen import autogen
 from .__init__ import __version__
+from .image import imageFactory
 
 
 def loglevel(string):
@@ -282,117 +286,6 @@ class Audio:
     def __repr__(self):
         return self.name
 
-
-class Image:
-    base_dir = Path()
-    target_dir = Path()
-
-    def __init__(self, options):
-        # assuming string
-        if not isinstance(options, dict):
-            options = {"name": options}
-
-        self.options = SETTINGS[
-            "gm"
-        ].copy()  # used for caching, if it's modified -> regenerate
-        self.options.update(options)
-
-    @property
-    def name(self):
-        return self.options["name"]
-
-    def convert(self, source, target, options):
-        if not CACHE.needs_to_be_generated(source, target, options):
-            logging.info("Skipped: %s is already generated", source)
-            return
-
-        if DEFAULTS["test"]:
-            return
-
-        gm_switches = {
-            "source": source,
-            "target": target,
-            "auto-orient": "-auto-orient" if options["auto-orient"] else "",
-            "strip": "-strip" if options["strip"] else "",
-            "quality": "-quality %s" % options["quality"]
-            if "quality" in options
-            else "-define jpeg:preserve-settings",
-            "resize": "-resize %s" % options["resize"]
-            if options.get("resize", None) is not None
-            else "",
-            "progressive": "-interlace Line"
-            if options.get("progressive", None) is True
-            else "",
-        }
-
-        command = (
-            "gm convert '{source}' {auto-orient} {strip} {progressive} {quality} {resize} "
-            "'{target}'"
-        ).format(**gm_switches)
-        logging.info("Generation: %s", source)
-
-        print(command)
-        if os.system(command) != 0:
-            logging.error("gm command failed")
-            sys.exit(1)
-
-        CACHE.cache_picture(source, target, options)
-
-    def copy(self):
-        source, target = self.base_dir.joinpath(self.name), self.target_dir.joinpath(
-            self.name
-        )
-
-        # XXX doing this DOESN'T improve perf at all (or something like 0.1%)
-        # if os.path.exists(target) and os.path.getsize(source) == os.path.getsize(target):
-        # print "Skipped %s since the file hasn't been modified based on file size" % source
-        # return ""
-        if not DEFAULTS["test"]:
-            options = self.options.copy()
-
-            if not options["auto-orient"] and not options["strip"]:
-                shutil.copyfile(source, target)
-                print(("%s%s%s" % (source, "->", target)))
-            else:
-                # Do not consider quality settings here, since we aim to copy the input image
-                # better to preserve input encoding setting
-                del options["quality"]
-                self.convert(source, target, options)
-
-        return ""
-
-    def generate_thumbnail(self, gm_geometry):
-        thumbnail_name = (
-            ".".join(self.name.split(".")[:-1])
-            + "-"
-            + gm_geometry
-            + "."
-            + self.name.split(".")[-1]
-        )
-        if not DEFAULTS["test"]:
-            source, target = (
-                self.base_dir.joinpath(self.name),
-                self.target_dir.joinpath(thumbnail_name),
-            )
-
-            options = self.options.copy()
-            options.update({"resize": gm_geometry})
-
-            self.convert(source, target, options)
-
-        return thumbnail_name
-
-    @property
-    def ratio(self):
-        command = "gm identify -format %w,%h " + self.base_dir.joinpath(self.name)
-        out = subprocess.check_output(command.split())
-        width, height = out.decode("utf-8").split(",")
-        return float(width) / int(height)
-
-    def __repr__(self):
-        return self.name
-
-
 class TCPServerV4(socketserver.TCPServer):
     allow_reuse_address = True
 
@@ -614,7 +507,7 @@ def create_cover(gallery_name, gallery_settings, gallery_path):
         "date": gallery_settings.get("date", ""),
         "tags": gallery_settings.get("tags", ""),
         "cover_type": cover_image_type,
-        "cover": cover_image_url,
+        "cover": gallery_settings["cover"],
     }
     return gallery_cover
 
@@ -644,7 +537,7 @@ def build_gallery(settings, gallery_settings, gallery_path, template):
     html = template_to_render.render(
         settings=settings,
         gallery=gallery_settings,
-        Image=Image,
+        Image=imageFactory,
         Video=Video,
         Audio=Audio,
         link=gallery_path,
@@ -688,7 +581,7 @@ def build_gallery(settings, gallery_settings, gallery_path, template):
     html = light_template_to_render.render(
         settings=settings,
         gallery=gallery_settings,
-        Image=Image,
+        Image=imageFactory,
         Video=Video,
         Audio=Audio,
         link=gallery_light_path,
@@ -739,7 +632,7 @@ def build_index(
         settings=settings,
         galleries=galleries_cover,
         sub_index=sub_index,
-        Image=Image,
+        Image=imageFactory,
         Video=Video,
     ).encode("Utf-8")
 
@@ -750,6 +643,84 @@ def build_index(
         html = encrypt(password, templates, gallery_path, settings, None)
 
         open(Path("build").joinpath(gallery_path, "index.html"), "wb").write(html)
+
+
+def render_thumbnails(base):
+    logging.debug("(%s) Rendering thumbnails", base.filepath)
+
+    img = Image.open(base.filepath)
+    exif = img.getexif()
+    format = img.format
+
+    options = SETTINGS["gm"].copy()
+    options.update(base.options)
+
+    params = { 'format': format, }
+    if 'progressive' in options:
+        params['progressive'] = options['progressive']
+    if 'quality' in options:
+        params['quality'] = options['quality']
+    if 'dpi' in img.info:
+        params['dpi'] = img.info['dpi']
+    if format == 'JPEG' or format == 'MPO':
+        params['subsampling'] = JpegImagePlugin.get_sampling(img)
+
+    # TODO: support orient option?
+    # TODO: Maybe use orient: auto
+    # Re-orient if requested and if Orientation EXIF metadata stored in 0x0112 states that
+    # it's not upright.
+    if exif:
+        if options.get("auto-orient", False) and exif.get(0x0112, 1) != 1:
+            logging.debug('(%s) Orientation EXIF tag set to %d: rotating thumbnails',
+                    base.filepath, exif.get(0x0112))
+            img = ImageOps.exif_transpose(img)
+
+        if not options.get("strip", False):
+            params["exif"] = img.info['exif']
+
+    for thumbnail in base.thumbnails.values():
+        filepath = Path("build") / thumbnail.filepath
+        thumb_params = dict()
+
+        if thumbnail.size == base.size and 'resize' in options:
+            match = re.match(r"^(\d+)%$", options['resize'])
+            if not match:
+                logging.error('resize option for %s is not a percentage. Aborting...',
+                        base.filepath)
+                # TODO: check sys exit in threads!!!!
+                sys.exit(1)
+
+            percentage = int(match.group(1))
+            thumb_params["resize"] = options["resize"]
+            height, width = base.size
+            thumbnail.size = height * percentage / 100, width * percentage / 100
+
+        if not CACHE.needs_to_be_generated(base.filepath, str(filepath),
+                { **params, **thumb_params }):
+            continue
+
+        # Needed because im.thumbnail replaces the original image
+        im = img.copy()
+
+        if thumbnail.size != base.size:
+            height, width = thumbnail.size
+            # im.thumbnail() needs both valid values in the size tuple.
+            # Moreover, the function creates a thumbnail whose dimensions are
+            # within the provided size.
+            # When only one dimension is specified, the other should thus be
+            # outrageously big so that the thumbnail dimension will always be
+            # of the specified value.
+            IGNORE_DIM = 65596
+            height = height if height is not None else IGNORE_DIM
+            width = width if width is not None else IGNORE_DIM
+            im.thumbnail((height, width), Image.LANCZOS)
+
+        logging.debug('(%s) Creating thumbnail %s: size=%s',
+                base.filepath, filepath, thumbnail.size)
+        im.save(filepath, **params)
+        logging.debug('(%s) Done creating thumbnail %s: size=%s',
+                base.filepath, filepath, thumbnail.size)
+        CACHE.cache_picture(base.filepath, str(filepath), { **params, **thumb_params })
 
 
 def main():
@@ -852,6 +823,10 @@ def main():
         front_page_galleries_cover.append(
             process_directory(gallery.normpath(), settings, templates)
         )
+
+    if not DEFAULTS["test"]:
+        with Pool() as pool:
+            pool.map(render_thumbnails, imageFactory.base_imgs.values())
 
     for i in includes:
         srcdir = Path(i).dirname()
