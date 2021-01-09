@@ -47,7 +47,15 @@ parser.add_argument(
     help="Configure the logging level",
 )
 subparser = parser.add_subparsers(dest="cmd")
-subparser.add_parser("build", help="Generate static site")
+parser_build = subparser.add_parser("build", help="Generate static site")
+parser_build.add_argument(
+    "-j",
+    "--jobs",
+    default=None,
+    type=int,
+    help="Specifies number of jobs (thumbnail generations) to run simultaneously. Default: number "
+    "of threads available on the system",
+)
 subparser.add_parser("test", help="Verify all your yaml data")
 subparser.add_parser("preview", help="Start preview webserver on port 9000")
 subparser.add_parser("deploy", help="Deploy your website")
@@ -928,7 +936,7 @@ def main():
         logger.info("Success: HTML file building without error")
         sys.exit(0)
 
-    with Pool() as pool:
+    with Pool(args.jobs) as pool:
         # Pool splits the iterable into pre-defined chunks which are then assigned to processes.
         # There is no other scheduling in play after that. This is an issue when chunks are
         # outrageously unbalanced in terms of CPU time which happens when most galleries are
